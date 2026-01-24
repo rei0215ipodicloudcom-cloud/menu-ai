@@ -4,29 +4,35 @@ from datetime import date, datetime
 import uuid
 import os
 import re
+import time
 
+import stripe
 from openai import OpenAI
 from openai import RateLimitError, AuthenticationError
 
 
 # ===============================
-# OpenAI
+# ENV
 # ===============================
-API_KEY = os.environ.get("OPENAI_API_KEY")
-client = OpenAI(api_key=API_KEY)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "price_1SpQvA2UN6ZlHho82SGAC1Qm")
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "")  # 例: https://xxx.streamlit.app
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 
 # ===============================
-# DB（回数制限 + 履歴）
+# DB
 # ===============================
 conn = sqlite3.connect("menu_ai.db", check_same_thread=False)
 cur = conn.cursor()
 
 
 def ensure_table_schema():
-    """既存DBがあっても壊れないように最低限のマイグレーションを行う"""
-
-    # usage
     cur.execute("""
     CREATE TABLE IF NOT EXISTS usage (
         user_id TEXT,
@@ -36,7 +42,6 @@ def ensure_table_schema():
     )
     """)
 
-    # history
     cur.execute("""
     CREATE TABLE IF NOT EXISTS history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,26 +59,16 @@ def ensure_table_schema():
     )
     """)
 
-    # 既存テーブルに不足カラムがあっても落ちないようにする
-    def add_col_if_missing(table, col, coltype="TEXT"):
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in cur.fetchall()]
-        if col not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
-
-    # history のカラム補完
-    add_col_if_missing("history", "user_id", "TEXT")
-    add_col_if_missing("history", "created_at", "TEXT")
-    add_col_if_missing("history", "mode", "TEXT")
-    add_col_if_missing("history", "input_text", "TEXT")
-    add_col_if_missing("history", "days", "INTEGER")
-    add_col_if_missing("history", "people", "INTEGER")
-    add_col_if_missing("history", "dishes", "INTEGER")
-    add_col_if_missing("history", "meals", "TEXT")
-    add_col_if_missing("history", "methods", "TEXT")
-    add_col_if_missing("history", "calorie", "INTEGER")
-    add_col_if_missing("history", "result", "TEXT")
-
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        user_id TEXT PRIMARY KEY,
+        stripe_customer_id TEXT,
+        stripe_subscription_id TEXT,
+        status TEXT,
+        current_period_end INTEGER,
+        updated_at TEXT
+    )
+    """)
     conn.commit()
 
 
@@ -81,10 +76,9 @@ ensure_table_schema()
 
 
 # ===============================
-# ユーザーID（リロードでも維持）
-# ✅ URLに uid を埋める → F5しても制限が戻りにくい
+# uid（リロード維持）
 # ===============================
-qp = st.query_params  # Streamlit 1.30+
+qp = st.query_params
 
 if "uid" in qp and qp["uid"]:
     user_id = qp["uid"]
@@ -96,7 +90,7 @@ today = str(date.today())
 
 
 # ===============================
-# 利用回数管理
+# usage
 # ===============================
 def get_today_count(uid, day):
     cur.execute("SELECT count FROM usage WHERE user_id=? AND day=?", (uid, day))
@@ -113,6 +107,9 @@ def increment_count(uid, day):
     conn.commit()
 
 
+# ===============================
+# history
+# ===============================
 def save_history(uid, mode, input_text, days, people, dishes, meals, methods, calorie, result):
     cur.execute("""
     INSERT INTO history (user_id, created_at, mode, input_text, days, people, dishes, meals, methods, calorie, result)
@@ -145,16 +142,80 @@ def load_history(uid, limit=5):
 
 
 # ===============================
-# 便利関数
+# Stripe subscription DB
 # ===============================
-def extract_first_dish_name(text: str) -> str:
-    m = re.search(r"【料理名】\s*(.+)", text)
-    if m:
-        return m.group(1).strip()
-    m2 = re.search(r"・\s*([^\n：]+)", text)
-    return m2.group(1).strip() if m2 else ""
+def upsert_subscription(uid, customer_id, sub_id, status, current_period_end):
+    cur.execute("""
+    INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      stripe_customer_id=excluded.stripe_customer_id,
+      stripe_subscription_id=excluded.stripe_subscription_id,
+      status=excluded.status,
+      current_period_end=excluded.current_period_end,
+      updated_at=excluded.updated_at
+    """, (
+        uid,
+        customer_id,
+        sub_id,
+        status,
+        int(current_period_end) if current_period_end else 0,
+        datetime.now().isoformat(timespec="seconds")
+    ))
+    conn.commit()
 
 
+def get_subscription(uid):
+    cur.execute("""
+    SELECT stripe_customer_id, stripe_subscription_id, status, current_period_end
+    FROM subscriptions
+    WHERE user_id=?
+    """, (uid,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "stripe_customer_id": row[0],
+        "stripe_subscription_id": row[1],
+        "status": row[2],
+        "current_period_end": row[3],
+    }
+
+
+def is_premium_by_db(uid) -> bool:
+    sub = get_subscription(uid)
+    if not sub:
+        return False
+
+    status = (sub["status"] or "").lower()
+    end_ts = int(sub["current_period_end"] or 0)
+    now_ts = int(time.time())
+
+    return (status in ["active", "trialing"]) and (end_ts == 0 or end_ts > now_ts)
+
+
+def refresh_subscription_from_stripe(uid):
+    if not STRIPE_SECRET_KEY:
+        return
+
+    sub = get_subscription(uid)
+    if not sub or not sub.get("stripe_subscription_id"):
+        return
+
+    try:
+        s = stripe.Subscription.retrieve(sub["stripe_subscription_id"])
+        status = s["status"]
+        current_period_end = s.get("current_period_end", 0)
+        customer_id = s.get("customer", "")
+
+        upsert_subscription(uid, customer_id, s["id"], status, current_period_end)
+    except Exception:
+        return
+
+
+# ===============================
+# helpers
+# ===============================
 def parse_shopping_list(result_text: str):
     shop_match = re.search(r"【買い物リスト】([\s\S]+)", result_text)
     if not shop_match:
@@ -201,7 +262,6 @@ def uniq_keep_order(items):
 
 
 def trim_menu_days(result_text: str, days: int) -> str:
-    """AIが勝手に日数増やした時、【献立】だけ指定日数にカット"""
     if days <= 0:
         return result_text
 
@@ -219,6 +279,43 @@ def trim_menu_days(result_text: str, days: int) -> str:
 
     start, end = m.span(1)
     return result_text[:start] + new_menu + result_text[end:]
+
+
+def create_checkout_session(uid: str):
+    if not (STRIPE_SECRET_KEY and APP_BASE_URL and STRIPE_PRICE_ID):
+        return None
+
+    success_url = f"{APP_BASE_URL}/?uid={uid}&success=1&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{APP_BASE_URL}/?uid={uid}&canceled=1"
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        client_reference_id=uid,
+        allow_promotion_codes=True,
+    )
+    return session.url
+
+
+def handle_return_from_stripe(uid: str):
+    if "success" in qp and qp.get("success") == "1" and "session_id" in qp and qp["session_id"]:
+        session_id = qp["session_id"]
+        try:
+            sess = stripe.checkout.Session.retrieve(session_id)
+            sub_id = sess.get("subscription")
+            customer_id = sess.get("customer")
+
+            if sub_id:
+                s = stripe.Subscription.retrieve(sub_id)
+                status = s["status"]
+                current_period_end = s.get("current_period_end", 0)
+
+                upsert_subscription(uid, customer_id, sub_id, status, current_period_end)
+                st.success("✅ プレミアム登録が完了しました！")
+        except Exception as e:
+            st.error(f"⚠️ Stripe確認に失敗しました: {e}")
 
 
 # ===============================
@@ -251,42 +348,61 @@ st.caption("✅ 食材＋条件で献立生成 / ✅ 料理名モードでレシ
 
 
 # ===============================
-# プレミアム（本番ではStripe判定に差し替え）
-# 広告は削除済み
+# Stripe return & Premium判定
 # ===============================
-if "premium" not in st.session_state:
-    st.session_state.premium = False
+premium = False
 
+if STRIPE_SECRET_KEY and APP_BASE_URL:
+    handle_return_from_stripe(user_id)
+    refresh_subscription_from_stripe(user_id)
+
+premium = is_premium_by_db(user_id)
+
+
+# ===============================
+# Sidebar（課金UI）
+# ===============================
 with st.sidebar:
-    st.markdown("## 💎 プラン")
-    st.checkbox("プレミアム（無制限）※テスト用", key="premium")
-    st.caption("本番はStripe連携で自動判定に置き換え予定")
+    st.markdown("## 💎 プレミアム（月300円）")
+    st.caption("✅ 無制限 / ✅ 制限解除")
 
-premium = st.session_state.premium
+    if premium:
+        st.success("🌟 プレミアム有効")
+    else:
+        st.info("🆓 無料プラン")
+        if not STRIPE_SECRET_KEY:
+            st.warning("STRIPE_SECRET_KEY が未設定です")
+        if not APP_BASE_URL:
+            st.warning("APP_BASE_URL が未設定です")
+
+        if STRIPE_SECRET_KEY and APP_BASE_URL:
+            if st.button("プレミアムにする（月300円）"):
+                url = create_checkout_session(user_id)
+                if url:
+                    st.link_button("Stripe決済ページを開く", url)
+                else:
+                    st.error("Checkout作成に失敗しました（設定を確認）")
 
 
 # ===============================
-# 無料制限（あなたのルール）
-# 無料：1日分まで + 1日3回まで
-# 有料：無制限
+# 無料制限
 # ===============================
 MAX_FREE_PER_DAY = 3
 today_count = get_today_count(user_id, today)
 
 if premium:
-    st.success("🌟 プレミアム：無制限")
+    st.success("🌟 プレミアム：無制限（回数制限なし / 日数制限なし）")
 else:
     st.info(f"🆓 本日の利用回数：{today_count} / {MAX_FREE_PER_DAY}（無料は1日分まで）")
     if today_count >= MAX_FREE_PER_DAY:
         st.error("⚠️ 無料利用は1日3回までです（明日リセット）")
         st.stop()
 
-
 st.markdown("---")
 
 
 # ===============================
-# 入力フォーム（機能は減らさない）
+# 入力フォーム
 # ===============================
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -301,7 +417,6 @@ with st.container():
 
     col1, col2, col3 = st.columns(3)
 
-    # ✅ 無料ユーザーは日数=1固定（UI上も1しか選べない）
     days_max = 7 if premium else 1
     with col1:
         days = st.number_input("日数", 1, days_max, 1, key="days")
@@ -347,10 +462,10 @@ with st.container():
 
 
 # ===============================
-# 実行処理
+# 実行
 # ===============================
 if run:
-    if not API_KEY:
+    if not OPENAI_API_KEY:
         st.error("⚠️ OPENAI_API_KEY が設定されていません（環境変数を確認）")
         st.stop()
 
@@ -458,32 +573,24 @@ if run:
             st.error(f"⚠️ エラーが発生しました\n\n{e}")
             st.stop()
 
-    # ✅ 1日なのに増えた時は削る（献立だけ）
     if not recipe_mode:
         result = trim_menu_days(result, int(days))
 
-    # ✅ 成功した時だけ回数カウント（無料だけ）
+    # 無料だけ回数カウント
     if not premium:
         increment_count(user_id, today)
 
-    # ✅ 履歴保存
     save_history(
         user_id, mode_name, text_input, int(days), int(people), int(dishes),
         selected_meals, methods, int(calorie), result
     )
 
-    # ===============================
-    # 結果本文
-    # ===============================
     st.subheader("📄 結果")
     st.text(result)
 
-    # ===============================
-    # 買い物リスト（チェック）
-    # ===============================
     st.subheader("🛒 買い物リスト（チェック）")
-
     day_items = parse_shopping_list(result)
+
     if not day_items:
         st.write("買い物リストが見つかりませんでした。")
     else:
@@ -492,7 +599,6 @@ if run:
 
         if day_keys_sorted:
             for day_key in day_keys_sorted:
-                # 指定日数より先は表示しない
                 try:
                     if int(day_key.replace("日目", "")) > int(days):
                         continue
@@ -512,9 +618,6 @@ if run:
             for idx, item in enumerate(items):
                 st.checkbox(item, key=f"shop_all_{idx}_{hash(item)}")
 
-    # ===============================
-    # 履歴表示
-    # ===============================
     with st.expander("🕘 履歴（最新5件）"):
         rows = load_history(user_id, 5)
         if not rows:
@@ -525,6 +628,8 @@ if run:
                 st.caption(f"入力：{inp}")
                 st.text(res_text)
                 st.divider()
+
+
 
 
 
