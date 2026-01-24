@@ -17,20 +17,16 @@ client = OpenAI(api_key=API_KEY)
 
 
 # ===============================
-# DB 接続
+# DB（回数制限 + 履歴）
 # ===============================
 conn = sqlite3.connect("menu_ai.db", check_same_thread=False)
 cur = conn.cursor()
 
 
-def ensure_tables_and_migrations():
-    """
-    ✅ DBが古くても壊れないようにする
-    ・テーブルが無ければ作成
-    ・列が無ければ追加（ALTER）
-    """
+def ensure_table_schema():
+    """既存DBがあっても壊れないように最低限のマイグレーションを行う"""
 
-    # usage（回数制限）
+    # usage
     cur.execute("""
     CREATE TABLE IF NOT EXISTS usage (
         user_id TEXT,
@@ -40,7 +36,7 @@ def ensure_tables_and_migrations():
     )
     """)
 
-    # history（履歴）
+    # history
     cur.execute("""
     CREATE TABLE IF NOT EXISTS history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,32 +54,49 @@ def ensure_tables_and_migrations():
     )
     """)
 
-    # premium（課金フラグ：将来Stripeで更新）
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS premium (
-        user_id TEXT PRIMARY KEY,
-        is_premium INTEGER DEFAULT 0
-    )
-    """)
+    # 既存テーブルに不足カラムがあっても落ちないようにする
+    def add_col_if_missing(table, col, coltype="TEXT"):
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        if col not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+
+    # history のカラム補完
+    add_col_if_missing("history", "user_id", "TEXT")
+    add_col_if_missing("history", "created_at", "TEXT")
+    add_col_if_missing("history", "mode", "TEXT")
+    add_col_if_missing("history", "input_text", "TEXT")
+    add_col_if_missing("history", "days", "INTEGER")
+    add_col_if_missing("history", "people", "INTEGER")
+    add_col_if_missing("history", "dishes", "INTEGER")
+    add_col_if_missing("history", "meals", "TEXT")
+    add_col_if_missing("history", "methods", "TEXT")
+    add_col_if_missing("history", "calorie", "INTEGER")
+    add_col_if_missing("history", "result", "TEXT")
 
     conn.commit()
 
 
-ensure_tables_and_migrations()
+ensure_table_schema()
 
 
 # ===============================
-# ユーザーID（セッション内維持）
+# ユーザーID（リロードでも維持）
+# ✅ URLに uid を埋める → F5しても制限が戻りにくい
 # ===============================
-if "user_id" not in st.session_state:
-    st.session_state.user_id = str(uuid.uuid4())
+qp = st.query_params  # Streamlit 1.30+
 
-user_id = st.session_state.user_id
+if "uid" in qp and qp["uid"]:
+    user_id = qp["uid"]
+else:
+    user_id = str(uuid.uuid4())
+    st.query_params["uid"] = user_id
+
 today = str(date.today())
 
 
 # ===============================
-# DB操作：回数制限
+# 利用回数管理
 # ===============================
 def get_today_count(uid, day):
     cur.execute("SELECT count FROM usage WHERE user_id=? AND day=?", (uid, day))
@@ -100,9 +113,6 @@ def increment_count(uid, day):
     conn.commit()
 
 
-# ===============================
-# DB操作：履歴
-# ===============================
 def save_history(uid, mode, input_text, days, people, dishes, meals, methods, calorie, result):
     cur.execute("""
     INSERT INTO history (user_id, created_at, mode, input_text, days, people, dishes, meals, methods, calorie, result)
@@ -135,25 +145,7 @@ def load_history(uid, limit=5):
 
 
 # ===============================
-# DB操作：プレミアム判定
-# ===============================
-def get_premium(uid):
-    cur.execute("SELECT is_premium FROM premium WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-    if row is None:
-        cur.execute("INSERT INTO premium (user_id, is_premium) VALUES (?, 0)", (uid,))
-        conn.commit()
-        return False
-    return bool(row[0])
-
-
-def set_premium(uid, value: bool):
-    cur.execute("UPDATE premium SET is_premium=? WHERE user_id=?", (1 if value else 0, uid))
-    conn.commit()
-
-
-# ===============================
-# 便利関数：料理名抽出
+# 便利関数
 # ===============================
 def extract_first_dish_name(text: str) -> str:
     m = re.search(r"【料理名】\s*(.+)", text)
@@ -163,9 +155,6 @@ def extract_first_dish_name(text: str) -> str:
     return m2.group(1).strip() if m2 else ""
 
 
-# ===============================
-# 便利関数：買い物リスト抽出
-# ===============================
 def parse_shopping_list(result_text: str):
     shop_match = re.search(r"【買い物リスト】([\s\S]+)", result_text)
     if not shop_match:
@@ -197,7 +186,8 @@ def parse_shopping_list(result_text: str):
     has_day = any(k.endswith("日目") for k in day_map.keys())
     if has_day:
         return day_map
-    return {"all": day_map.get("all", [])}
+    else:
+        return {"all": day_map.get("all", [])}
 
 
 def uniq_keep_order(items):
@@ -210,6 +200,27 @@ def uniq_keep_order(items):
     return out
 
 
+def trim_menu_days(result_text: str, days: int) -> str:
+    """AIが勝手に日数増やした時、【献立】だけ指定日数にカット"""
+    if days <= 0:
+        return result_text
+
+    m = re.search(r"【献立】([\s\S]*?)(?=\n【材料】|\n【作り方】|\n【買い物リスト】|$)", result_text)
+    if not m:
+        return result_text
+
+    menu_block = m.group(1)
+    day_blocks = re.findall(r"(\d+日目：[\s\S]*?)(?=\n\d+日目：|$)", menu_block)
+    if len(day_blocks) <= days:
+        return result_text
+
+    kept = "\n".join(day_blocks[:days]).strip()
+    new_menu = f"\n{kept}\n"
+
+    start, end = m.span(1)
+    return result_text[:start] + new_menu + result_text[end:]
+
+
 # ===============================
 # UI
 # ===============================
@@ -219,53 +230,63 @@ st.markdown("""
 <style>
 .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 560px; }
 h1, h2, h3 { font-family: "Noto Sans JP", sans-serif; }
-.stButton>button { width: 100%; padding: 14px 16px; border-radius: 14px; font-size: 18px; font-weight: 700; }
-.card { background: #fff; border-radius: 18px; padding: 18px; box-shadow: 0 8px 24px rgba(0,0,0,0.06); }
+.stButton>button {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 14px;
+  font-size: 18px;
+  font-weight: 700;
+}
+.card {
+  background: #fff;
+  border-radius: 18px;
+  padding: 18px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.06);
+}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🍳 献立AI（Streamlit版）")
 st.caption("✅ 食材＋条件で献立生成 / ✅ 料理名モードでレシピ確認")
 
+
 # ===============================
-# プレミアム（本番はStripeでONにする）
-# いまはテスト用に画面から切替できるようにする
+# プレミアム（本番ではStripe判定に差し替え）
+# 広告は削除済み
 # ===============================
-is_premium = get_premium(user_id)
+if "premium" not in st.session_state:
+    st.session_state.premium = False
 
 with st.sidebar:
-    st.subheader("💎 プラン")
-    st.write(f"あなたの状態：{'プレミアム' if is_premium else '無料'}")
-    # ✅ テスト用スイッチ（本番ではStripeで自動ON）
-    if st.checkbox("（テスト）プレミアムにする", value=is_premium):
-        set_premium(user_id, True)
-        is_premium = True
-    else:
-        set_premium(user_id, False)
-        is_premium = False
+    st.markdown("## 💎 プラン")
+    st.checkbox("プレミアム（無制限）※テスト用", key="premium")
+    st.caption("本番はStripe連携で自動判定に置き換え予定")
 
-    st.divider()
-    st.write("無料：1日3回まで + 1日分のみ")
-    st.write("プレミアム：無制限（予定：300円/月）")
+premium = st.session_state.premium
+
 
 # ===============================
-# 無料制限：1日3回
+# 無料制限（あなたのルール）
+# 無料：1日分まで + 1日3回まで
+# 有料：無制限
 # ===============================
 MAX_FREE_PER_DAY = 3
 today_count = get_today_count(user_id, today)
 
-if not is_premium:
-    st.info(f"🆓 本日の利用回数：{today_count} / {MAX_FREE_PER_DAY}")
-
+if premium:
+    st.success("🌟 プレミアム：無制限")
+else:
+    st.info(f"🆓 本日の利用回数：{today_count} / {MAX_FREE_PER_DAY}（無料は1日分まで）")
     if today_count >= MAX_FREE_PER_DAY:
         st.error("⚠️ 無料利用は1日3回までです（明日リセット）")
         st.stop()
-else:
-    st.success("💎 プレミアム：回数制限なし")
+
+
+st.markdown("---")
 
 
 # ===============================
-# 入力フォーム（機能削除なし）
+# 入力フォーム（機能は減らさない）
 # ===============================
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -279,10 +300,17 @@ with st.container():
     )
 
     col1, col2, col3 = st.columns(3)
+
+    # ✅ 無料ユーザーは日数=1固定（UI上も1しか選べない）
+    days_max = 7 if premium else 1
     with col1:
-        days = st.number_input("日数", 1, 7, 1, key="days")
+        days = st.number_input("日数", 1, days_max, 1, key="days")
+        if not premium:
+            st.caption("🆓 無料は1日分まで")
+
     with col2:
         people = st.number_input("人数", 1, 10, 1, key="people")
+
     with col3:
         dishes = st.number_input("品数/食", 1, 5, 1, key="dishes")
 
@@ -298,9 +326,12 @@ with st.container():
         meal_dinner = st.checkbox("夜", value=True, key="meal_dinner")
 
     selected_meals = []
-    if meal_morning: selected_meals.append("朝")
-    if meal_lunch: selected_meals.append("昼")
-    if meal_dinner: selected_meals.append("夜")
+    if meal_morning:
+        selected_meals.append("朝")
+    if meal_lunch:
+        selected_meals.append("昼")
+    if meal_dinner:
+        selected_meals.append("夜")
     if not selected_meals:
         selected_meals = ["夜"]
 
@@ -310,23 +341,17 @@ with st.container():
         key="methods"
     )
 
+    run = st.button("献立を作る", use_container_width=True)
+
     st.markdown("</div>", unsafe_allow_html=True)
-
-# ✅ 無料は「1日分」まで（稼ぐ仕様）
-if not is_premium and not recipe_mode:
-    if int(days) > 1:
-        st.warning("🆓 無料は1日分までです。プレミアムなら7日分OK！")
-        days = 1
-
-run = st.button("献立を作る", use_container_width=True)
 
 
 # ===============================
-# 実行
+# 実行処理
 # ===============================
 if run:
     if not API_KEY:
-        st.error("⚠️ OPENAI_API_KEY が設定されていません（環境変数を確認してください）")
+        st.error("⚠️ OPENAI_API_KEY が設定されていません（環境変数を確認）")
         st.stop()
 
     if not text_input.strip():
@@ -335,7 +360,6 @@ if run:
 
     method_text = "、".join(methods) if methods else "なし"
 
-    # プロンプト
     if recipe_mode:
         prompt = f"""
 あなたは料理の先生です。
@@ -386,6 +410,7 @@ if run:
 ・「1日目」「2日目」…の日数表記にする
 ・{days}日分を超えない
 ・入力食材以外は絶対に追加しない（調味料は例外OK）
+・各料理は「料理名 + 一言」も入れる
 
 【出力形式（必ずこの形）】
 【献立】
@@ -433,8 +458,12 @@ if run:
             st.error(f"⚠️ エラーが発生しました\n\n{e}")
             st.stop()
 
-    # ✅ 成功した時だけ回数カウント（無料のみ）
-    if not is_premium:
+    # ✅ 1日なのに増えた時は削る（献立だけ）
+    if not recipe_mode:
+        result = trim_menu_days(result, int(days))
+
+    # ✅ 成功した時だけ回数カウント（無料だけ）
+    if not premium:
         increment_count(user_id, today)
 
     # ✅ 履歴保存
@@ -444,7 +473,7 @@ if run:
     )
 
     # ===============================
-    # 表示：結果
+    # 結果本文
     # ===============================
     st.subheader("📄 結果")
     st.text(result)
@@ -496,6 +525,12 @@ if run:
                 st.caption(f"入力：{inp}")
                 st.text(res_text)
                 st.divider()
+
+
+
+
+
+
 
 
 
