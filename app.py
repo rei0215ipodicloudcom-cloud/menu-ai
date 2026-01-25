@@ -16,7 +16,7 @@ from openai import RateLimitError, AuthenticationError
 # ===============================
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "price_1SpQvA2UN6ZlHho82SGAC1Qm")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "")  # 例: https://xxx.streamlit.app
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -66,6 +66,7 @@ def ensure_table_schema():
         stripe_subscription_id TEXT,
         status TEXT,
         current_period_end INTEGER,
+        cancel_at_period_end INTEGER,
         updated_at TEXT
     )
     """)
@@ -79,7 +80,6 @@ ensure_table_schema()
 # uid（リロード維持）
 # ===============================
 qp = st.query_params
-
 if "uid" in qp and qp["uid"]:
     user_id = qp["uid"]
 else:
@@ -142,24 +142,26 @@ def load_history(uid, limit=5):
 
 
 # ===============================
-# Stripe subscription DB
+# subscription DB
 # ===============================
-def upsert_subscription(uid, customer_id, sub_id, status, current_period_end):
+def upsert_subscription(uid, customer_id, sub_id, status, current_period_end, cancel_at_period_end):
     cur.execute("""
-    INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO subscriptions (user_id, stripe_customer_id, stripe_subscription_id, status, current_period_end, cancel_at_period_end, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
       stripe_customer_id=excluded.stripe_customer_id,
       stripe_subscription_id=excluded.stripe_subscription_id,
       status=excluded.status,
       current_period_end=excluded.current_period_end,
+      cancel_at_period_end=excluded.cancel_at_period_end,
       updated_at=excluded.updated_at
     """, (
         uid,
-        customer_id,
-        sub_id,
-        status,
+        customer_id or "",
+        sub_id or "",
+        status or "",
         int(current_period_end) if current_period_end else 0,
+        1 if cancel_at_period_end else 0,
         datetime.now().isoformat(timespec="seconds")
     ))
     conn.commit()
@@ -167,7 +169,7 @@ def upsert_subscription(uid, customer_id, sub_id, status, current_period_end):
 
 def get_subscription(uid):
     cur.execute("""
-    SELECT stripe_customer_id, stripe_subscription_id, status, current_period_end
+    SELECT stripe_customer_id, stripe_subscription_id, status, current_period_end, cancel_at_period_end
     FROM subscriptions
     WHERE user_id=?
     """, (uid,))
@@ -178,39 +180,140 @@ def get_subscription(uid):
         "stripe_customer_id": row[0],
         "stripe_subscription_id": row[1],
         "status": row[2],
-        "current_period_end": row[3],
+        "current_period_end": int(row[3] or 0),
+        "cancel_at_period_end": bool(row[4] or 0),
     }
 
 
-def is_premium_by_db(uid) -> bool:
+# ===============================
+# Stripe: Checkout / 状態同期 / 解約
+# ===============================
+def create_checkout_session(uid: str):
+    if not (STRIPE_SECRET_KEY and APP_BASE_URL and STRIPE_PRICE_ID):
+        return None
+
+    # ✅ ASCII URLのみ（日本語NG）
+    success_url = f"{APP_BASE_URL}/?uid={uid}&success=1&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{APP_BASE_URL}/?uid={uid}&canceled=1"
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        client_reference_id=uid,
+        allow_promotion_codes=True,
+    )
+    return session.url
+
+
+def handle_return_from_stripe(uid: str):
+    """決済完了後、Stripe側のsession_idからsubscriptionをDBに保存"""
+    if not STRIPE_SECRET_KEY:
+        return
+
+    if qp.get("success") == "1" and qp.get("session_id"):
+        session_id = qp["session_id"]
+        try:
+            sess = stripe.checkout.Session.retrieve(session_id)
+            sub_id = sess.get("subscription")
+            customer_id = sess.get("customer")
+
+            if sub_id:
+                s = stripe.Subscription.retrieve(sub_id)
+                status = s["status"]
+                current_period_end = s.get("current_period_end", 0)
+                cancel_at_period_end = bool(s.get("cancel_at_period_end", False))
+
+                upsert_subscription(uid, customer_id, sub_id, status, current_period_end, cancel_at_period_end)
+                st.success("✅ プレミアム登録が完了しました！")
+
+                # ✅ URLを掃除（毎回success表示されるの防止）
+                st.query_params["uid"] = uid
+                st.rerun()
+
+        except Exception as e:
+            st.error(f"⚠️ Stripe確認に失敗しました: {e}")
+
+
+def refresh_subscription_from_stripe(uid: str):
+    """毎回Stripeを見に行って “今の状態” をDBへ同期（Webhook無しでもズレにくい）"""
+    if not STRIPE_SECRET_KEY:
+        return
+
+    sub = get_subscription(uid)
+    if not sub:
+        return
+
+    sub_id = sub.get("stripe_subscription_id")
+    if not sub_id:
+        return
+
+    try:
+        s = stripe.Subscription.retrieve(sub_id)
+        status = s["status"]
+        current_period_end = s.get("current_period_end", 0)
+        customer_id = s.get("customer", "")
+        cancel_at_period_end = bool(s.get("cancel_at_period_end", False))
+
+        upsert_subscription(uid, customer_id, s["id"], status, current_period_end, cancel_at_period_end)
+    except Exception:
+        return
+
+
+def is_premium(uid: str) -> bool:
+    """最終判定（active/trialingならプレミアム扱い）"""
     sub = get_subscription(uid)
     if not sub:
         return False
 
     status = (sub["status"] or "").lower()
-    end_ts = int(sub["current_period_end"] or 0)
     now_ts = int(time.time())
+    end_ts = int(sub["current_period_end"] or 0)
 
-    return (status in ["active", "trialing"]) and (end_ts == 0 or end_ts > now_ts)
+    # ✅ active / trialing ならOK（cancel予約してても期間内はOK）
+    if status in ["active", "trialing"]:
+        if end_ts == 0:
+            return True
+        return end_ts > now_ts
+
+    return False
 
 
-def refresh_subscription_from_stripe(uid):
+def cancel_subscription_at_period_end(uid: str):
+    """✅ 解約予約（次回更新で停止）"""
     if not STRIPE_SECRET_KEY:
-        return
+        return False, "STRIPE_SECRET_KEY未設定"
 
     sub = get_subscription(uid)
     if not sub or not sub.get("stripe_subscription_id"):
-        return
+        return False, "subscription情報が見つかりません"
 
     try:
-        s = stripe.Subscription.retrieve(sub["stripe_subscription_id"])
-        status = s["status"]
-        current_period_end = s.get("current_period_end", 0)
-        customer_id = s.get("customer", "")
+        sub_id = sub["stripe_subscription_id"]
+        stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+        refresh_subscription_from_stripe(uid)
+        return True, "解約予約しました（期限まではプレミアム利用できます）"
+    except Exception as e:
+        return False, f"Stripe解約予約エラー: {e}"
 
-        upsert_subscription(uid, customer_id, s["id"], status, current_period_end)
-    except Exception:
-        return
+
+def cancel_subscription_immediately(uid: str):
+    """⚠️ 今すぐ解約（即停止）"""
+    if not STRIPE_SECRET_KEY:
+        return False, "STRIPE_SECRET_KEY未設定"
+
+    sub = get_subscription(uid)
+    if not sub or not sub.get("stripe_subscription_id"):
+        return False, "subscription情報が見つかりません"
+
+    try:
+        sub_id = sub["stripe_subscription_id"]
+        stripe.Subscription.delete(sub_id)  # 即キャンセル
+        refresh_subscription_from_stripe(uid)
+        return True, "今すぐ解約しました"
+    except Exception as e:
+        return False, f"Stripe即解約エラー: {e}"
 
 
 # ===============================
@@ -281,43 +384,6 @@ def trim_menu_days(result_text: str, days: int) -> str:
     return result_text[:start] + new_menu + result_text[end:]
 
 
-def create_checkout_session(uid: str):
-    if not (STRIPE_SECRET_KEY and APP_BASE_URL and STRIPE_PRICE_ID):
-        return None
-
-    success_url = f"{APP_BASE_URL}/?uid={uid}&success=1&session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{APP_BASE_URL}/?uid={uid}&canceled=1"
-
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        client_reference_id=uid,
-        allow_promotion_codes=True,
-    )
-    return session.url
-
-
-def handle_return_from_stripe(uid: str):
-    if "success" in qp and qp.get("success") == "1" and "session_id" in qp and qp["session_id"]:
-        session_id = qp["session_id"]
-        try:
-            sess = stripe.checkout.Session.retrieve(session_id)
-            sub_id = sess.get("subscription")
-            customer_id = sess.get("customer")
-
-            if sub_id:
-                s = stripe.Subscription.retrieve(sub_id)
-                status = s["status"]
-                current_period_end = s.get("current_period_end", 0)
-
-                upsert_subscription(uid, customer_id, sub_id, status, current_period_end)
-                st.success("✅ プレミアム登録が完了しました！")
-        except Exception as e:
-            st.error(f"⚠️ Stripe確認に失敗しました: {e}")
-
-
 # ===============================
 # UI
 # ===============================
@@ -347,35 +413,69 @@ st.title("🍳 献立AI（Streamlit版）")
 st.caption("✅ 食材＋条件で献立生成 / ✅ 料理名モードでレシピ確認")
 
 
-# ===============================
-# Stripe return & Premium判定
-# ===============================
-premium = False
-
+# Stripe return & sync
 if STRIPE_SECRET_KEY and APP_BASE_URL:
     handle_return_from_stripe(user_id)
-    refresh_subscription_from_stripe(user_id)
 
-premium = is_premium_by_db(user_id)
+# ✅ 重要：毎回Stripeから最新状態を同期（Webhook無しでも強い）
+refresh_subscription_from_stripe(user_id)
+
+premium = is_premium(user_id)
 
 
 # ===============================
-# Sidebar（課金UI）
+# Sidebar（課金UI + 解約）
 # ===============================
 with st.sidebar:
     st.markdown("## 💎 プレミアム（月300円）")
     st.caption("✅ 無制限 / ✅ 制限解除")
 
+    sub = get_subscription(user_id)
+
     if premium:
         st.success("🌟 プレミアム有効")
+
+        if sub:
+            end_ts = sub.get("current_period_end", 0)
+            if end_ts:
+                end_date = datetime.fromtimestamp(end_ts).strftime("%Y-%m-%d")
+                st.caption(f"次回更新/期限：{end_date}")
+
+            if sub.get("cancel_at_period_end"):
+                st.warning("⚠️ 解約予約済み（期限までは利用OK）")
+
+        st.divider()
+
+        st.markdown("### 解約")
+        if st.button("✅ 解約予約（次回更新で停止）"):
+            ok, msg = cancel_subscription_at_period_end(user_id)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        with st.expander("⚠️ 今すぐ解約（即停止）"):
+            st.caption("※押すと即プレミアムが止まります（注意）")
+            if st.button("🚨 今すぐ解約する"):
+                ok, msg = cancel_subscription_immediately(user_id)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
     else:
         st.info("🆓 無料プラン")
+
         if not STRIPE_SECRET_KEY:
             st.warning("STRIPE_SECRET_KEY が未設定です")
         if not APP_BASE_URL:
             st.warning("APP_BASE_URL が未設定です")
+        if not STRIPE_PRICE_ID:
+            st.warning("STRIPE_PRICE_ID が未設定です")
 
-        if STRIPE_SECRET_KEY and APP_BASE_URL:
+        if STRIPE_SECRET_KEY and APP_BASE_URL and STRIPE_PRICE_ID:
             if st.button("プレミアムにする（月300円）"):
                 url = create_checkout_session(user_id)
                 if url:
@@ -385,9 +485,9 @@ with st.sidebar:
 
 
 # ===============================
-# 無料制限
+# ✅ 無料制限（1日1回）
 # ===============================
-MAX_FREE_PER_DAY = 3
+MAX_FREE_PER_DAY = 1
 today_count = get_today_count(user_id, today)
 
 if premium:
@@ -395,7 +495,7 @@ if premium:
 else:
     st.info(f"🆓 本日の利用回数：{today_count} / {MAX_FREE_PER_DAY}（無料は1日分まで）")
     if today_count >= MAX_FREE_PER_DAY:
-        st.error("⚠️ 無料利用は1日3回までです（明日リセット）")
+        st.error("⚠️ 無料利用は1日1回までです（明日リセット）")
         st.stop()
 
 st.markdown("---")
@@ -457,7 +557,6 @@ with st.container():
     )
 
     run = st.button("献立を作る", use_container_width=True)
-
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -504,7 +603,6 @@ if run:
 ・材料名
 """
         mode_name = "料理名モード"
-
     else:
         prompt = f"""
 あなたは一人暮らし向け献立アドバイザーです。
@@ -534,8 +632,6 @@ if run:
 ・料理名：一言
 （1食あたり{dishes}品）
 
-（必要な日数分だけ繰り返す）
-
 【材料】
 （料理ごとに）
 ・材料名 分量
@@ -548,11 +644,10 @@ if run:
 【買い物リスト】
 1日目：
 ・材料
-（必要な日数分だけ）
 """
         mode_name = "献立モード"
 
-    with st.spinner("生成中…（10〜30秒くらいかかることがあります）"):
+    with st.spinner("生成中…"):
         try:
             res = client.responses.create(
                 model="gpt-4.1-mini",
@@ -560,15 +655,12 @@ if run:
                 max_output_tokens=900
             )
             result = res.output_text
-
         except RateLimitError:
-            st.error("⚠️ 混雑中です（API制限）。少し待ってもう一回押してください。")
+            st.error("⚠️ 混雑中です。少し待ってもう一回押してください。")
             st.stop()
-
         except AuthenticationError as e:
-            st.error(f"⚠️ APIキーが違う/無効です\n\n{e}")
+            st.error(f"⚠️ APIキーが無効です\n\n{e}")
             st.stop()
-
         except Exception as e:
             st.error(f"⚠️ エラーが発生しました\n\n{e}")
             st.stop()
@@ -599,18 +691,8 @@ if run:
 
         if day_keys_sorted:
             for day_key in day_keys_sorted:
-                try:
-                    if int(day_key.replace("日目", "")) > int(days):
-                        continue
-                except:
-                    pass
-
                 st.markdown(f"### {day_key}")
                 items = uniq_keep_order(day_items.get(day_key, []))
-                if not items:
-                    st.caption("（なし）")
-                    continue
-
                 for idx, item in enumerate(items):
                     st.checkbox(item, key=f"shop_{day_key}_{idx}_{hash(item)}")
         else:
@@ -624,10 +706,11 @@ if run:
             st.write("まだ履歴がありません。")
         else:
             for i, (created_at, mode, inp, res_text) in enumerate(rows, start=1):
-                st.markdown(f"**{i}件目**  `{created_at}`  （{mode}）")
+                st.markdown(f"**{i}件目** `{created_at}`（{mode}）")
                 st.caption(f"入力：{inp}")
                 st.text(res_text)
                 st.divider()
+
 
 
 
